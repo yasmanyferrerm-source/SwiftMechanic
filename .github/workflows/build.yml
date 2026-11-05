@@ -1,0 +1,80 @@
+name: Build SwiftMechanic
+
+# Run manually (Actions tab, or the PC Build Tool via `gh workflow run`).
+# Builds the Android APK (install on phone) and, if signing secrets are set,
+# the signed release APK + AAB (Google Play upload), then publishes a GitHub Release.
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: Release notes (optional)
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Create Android project
+        run: |
+          npx cap add android
+          node scripts/patch-android.cjs
+          npx cap sync android
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+      - name: Build debug APK (installable)
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+      - name: Build signed release APK + AAB (only if keystore secrets are set)
+        if: env.KEYSTORE_B64 != ''
+        working-directory: android
+        env:
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          ./gradlew assembleRelease bundleRelease --no-daemon \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.jks" \
+            -Pandroid.injected.signing.store.password="$KS_PASS" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASS"
+      - name: Collect outputs
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          mkdir -p out
+          cp android/app/build/outputs/apk/debug/app-debug.apk "out/SwiftMechanic-${VERSION}.apk"
+          if [ -f android/app/build/outputs/apk/release/app-release.apk ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk "out/SwiftMechanic-${VERSION}-release.apk"
+          fi
+          if [ -f android/app/build/outputs/bundle/release/app-release.aab ]; then
+            cp android/app/build/outputs/bundle/release/app-release.aab "out/SwiftMechanic-${VERSION}-release.aab"
+          fi
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ github.event.inputs.notes }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v${VERSION}-build${{ github.run_number }}"
+          BODY="SwiftMechanic ${VERSION} (build ${{ github.run_number }})"
+          if [ -n "$NOTES" ]; then BODY="$BODY"$'\n\n'"$NOTES"; fi
+          BODY="$BODY"$'\n\n'"- SwiftMechanic-*.apk: install on your phone"$'\n'"- SwiftMechanic-*-release.aab: upload to Google Play Console"
+          gh release create "$TAG" out/* --title "SwiftMechanic ${VERSION} (build ${{ github.run_number }})" --notes "$BODY"
